@@ -95,11 +95,11 @@ def predict_SVOS(model_cuda=None, params='', add_name='', dataset='16val', save_
 
 if __name__ == '__main__':
 
-    predict_SVOS(params='RANet_video_single.pth', dataset='16val', save_root='../predictions/RANet_Video_16val')
+#     predict_SVOS(params='RANet_video_single.pth', dataset='16val', save_root='../predictions/RANet_Video_16val')
 
     # predict_SVOS(params='RANet_image_single.pth', dataset='16all', save_root='../predictions/RANet_Image_16all')
 
-    # predict_SVOS(params='RANet_video_multi.pth', dataset='17val', save_root='../predictions/RANet_Video_17val')
+    predict_SVOS(params='RANet_video_multi.pth', dataset='17val', save_root='../predictions/RANet_Video_17val')
 
     # predict_SVOS(params='RANet_video_multi.pth', dataset='17test_dev', save_root='../predictions/RANet_Video_17test_dev')
 

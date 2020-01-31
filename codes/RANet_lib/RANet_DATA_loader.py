@@ -73,6 +73,8 @@ class DAVIS2017_loader(data.Dataset):
                     Set = '/trainval.txt'
                 elif DP['mode'] in ['test_dev', '17test_dev']:
                     Set = '/test-dev.txt'
+                elif DP['mode'] in ['17train']:
+                    Set = '/train.txt'
                 with open(self.root + 'ImageSets/' + self.years + Set) as f:
                     SetsTxts = f.readlines()
                 # if DP['mode'] in ['all', 'online_all']:
@@ -100,7 +102,7 @@ class DAVIS2017_loader(data.Dataset):
                     if DP['reading_type'] != 'SVOS-YTB':
                         _mask = np.array(Image.open(Y_files[0]).convert("P"))
                         self.num_objects.append(np.max(_mask))
-                if DP['mode'] == 'train':
+                if DP['mode'] in ['train', '17train']:
                     X_train = X
                     y_train = Y
                 elif DP['mode'] in ['test', 'all', 'test_dev', '17test_dev', '16val', '17val', '16all', 'YTB18']:

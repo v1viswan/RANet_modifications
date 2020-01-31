@@ -92,7 +92,7 @@ def test_SVOS_Video_batch(data_loader, model, save_root, threshold=0.5, single_o
                             Img_flags=[[] for i in range(batchsize)])
         return Frames_batch
     batchsize = 4
-    max_iter = 10
+    max_iter = 5
     torch.set_grad_enabled(False)
     _ = None
     Frames_batch = init_Frame(batchsize)
@@ -134,6 +134,7 @@ def test_SVOS_Video_batch(data_loader, model, save_root, threshold=0.5, single_o
         Frames_batch['Img_flags'][loc].extend([1] + [2 for i in range(Fsize - 2)] + [3])
 
         if iteration % max_iter == 0 or iteration == len(data_loader):
+            print("Sending first batch of images for prediction, iteration:", iteration)
             for idx in range(batchsize):
                 Frames_batch['Flags'][idx].append(False)
             Frames_batch['Sizes'][batchsize] = min(Frames_batch['Sizes'][0:batchsize - 1])
@@ -163,6 +164,8 @@ def test_SVOS_Video_batch(data_loader, model, save_root, threshold=0.5, single_o
                     # print(save_path + fname.split('.')[0])
             del(Frames_batch)
             Frames_batch = init_Frame(batchsize)
+        
+    print("Done processing, imafes saved at path:", save_path)
     return
 
 def process_SVOS_batch(Frames_batch, model, threshold=0.5, single_object=False, pre_first_frame=False):
@@ -186,7 +189,10 @@ def process_SVOS_batch(Frames_batch, model, threshold=0.5, single_object=False, 
     batchsize = Frames_batch['batchsize']
     Frame_Flags = Frames_batch['Flags']
     Out_Mask = [[] for i in range(batchsize)]
-    size = Frames[0][0].size()[2::]
+    
+    size = Frames[0][0].size()[2::] ####
+    print("\n had to change here in ipython, Frames shape now:",np.shape(Frames))
+    
     torch.cuda.empty_cache()
     # msk_p = Key_mask
     KFea = [[] for i in range(batchsize)]
@@ -218,7 +224,7 @@ def process_SVOS_batch(Frames_batch, model, threshold=0.5, single_object=False, 
                             out0 = out0.ge(1.6).float() + 1
                     Out_Mask[batch].append(out0.data.cpu().numpy())
             # crop current frame
-            frame = bbox_crop(frame[0], BBox[batch]).unsqueeze(0)
+            frame = bbox_crop(frame[0], BBox[batch]).unsqueeze(0)     ######## was changed here in ipython
             # print(Crop_size)
             # print(batch)
             Crop_size[batch] = frame.size()
@@ -268,7 +274,7 @@ def process_SVOS_batch(Frames_batch, model, threshold=0.5, single_object=False, 
             PMsk[batch] = F.upsample(Variable(bbox_crop(msk[0], BBox[batch]).unsqueeze(0), volatile=True).cuda(), size)
     return Out_Mask
 
-def fitpredict17(data_set, model, add_name='', threads=32, batchSize=1, save_root ='./test/'):
+def fitpredict17(data_set, model, add_name='', threads=1, batchSize=1, save_root ='./test/'):
     if data_set.Datasets_params[0]['mode'] in ['16val', '16all']:
         threshold = 0.5
         single_object = True
@@ -278,7 +284,8 @@ def fitpredict17(data_set, model, add_name='', threads=32, batchSize=1, save_roo
     else:
         threshold = 0.5
         single_object = False
-    print('Start testing ...')
+    threads=0
+    print('Start testing ..., workers for dataloader:',threads,'batch size:', batchSize)
     data_set.iter_mode = 'test'
     data_loader = DataLoader(dataset=data_set, num_workers=threads, batch_size=batchSize, shuffle=False, pin_memory=True)
     model.eval()

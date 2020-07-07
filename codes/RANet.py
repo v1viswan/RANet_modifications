@@ -29,7 +29,7 @@ parser.add_argument('--threads', type=int, default=16, help='number of threads f
 parser.add_argument('--workfolder', default='../models/')
 parser.add_argument('--savePName', default=net_name)
 parser.add_argument('--net_type', default='single_object')
-parser.add_argument('--fp16', default=True)
+parser.add_argument('--fp16', default=False)
 print('===> Setting ......')
 opt = parser.parse_args()
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -50,24 +50,31 @@ print('===> Building model')
 
 model = Net(pretrained=False, type=opt.net_type)
 model_cuda = None
+apply_nms = False
 
-
-def predict_SVOS(model_cuda=None, params='', add_name='', dataset='16val', save_root='./test/'):
+def predict_SVOS(model_cuda=None, params='', add_name='', dataset='16val', save_root='./test/', disc_scale=0):
     inSize1 = 480
     inSize2 = 864
     print('save root = ' + save_root)
     if dataset in ['16val', '16trainval', '16all']:
         model.set_type('single_object')
         year = '2016'
-    elif dataset in ['17val', '17test_dev']:
+    elif dataset in ['17train', '17val', '17test_dev', '17test_chl']:
         model.set_type('multi_object')
         year = '2017'
     else:
         assert('dataset error')
 
+    if (dataset == '17test_dev'):
+        dataset_root = '../datasets/DAVIS/Test_dev/DAVIS/'
+    elif (dataset == '17test_chl'):
+        dataset_root = '../datasets/DAVIS/Test_challenge/DAVIS/'
+    else :
+        dataset_root = '../datasets/DAVIS/'
+        
     DAVIS = dict(reading_type='SVOS',
                      year=year,
-                 root='../datasets/DAVIS/',
+                 root=dataset_root,
                  subfolder=['', '', ''],
                  mode=dataset,
                  tar_mode='rep',
@@ -75,8 +82,12 @@ def predict_SVOS(model_cuda=None, params='', add_name='', dataset='16val', save_
                  length=None,
                  init_folder=None,
                  )
+#     if (dataset in ['17train']):
+#         mode = 'train'
+#     else:
+    mode = 'test'
     dataset = DAVIS2017_loader(
-        [DAVIS], mode='test',
+        [DAVIS], mode=mode,
         transform=[PAD_transform([inSize1, inSize2], random=False),
                    PAD_transform([inSize1, inSize2], random=False)],
         rand=Rand_num())
@@ -89,8 +100,11 @@ def predict_SVOS(model_cuda=None, params='', add_name='', dataset='16val', save_
     if opt.fp16:
         model_cuda = model_cuda.half()
         model_cuda.fp16 = True
-
-    fitpredict17(dataset, model_cuda, add_name=add_name, threads=1, batchSize=1, save_root=save_root)
+        
+    ################## Remove this if not using nms
+    model.apply_nms=apply_nms
+    print("Using NMS:", model.apply_nms, "\n\n")
+    fitpredict17(dataset, model_cuda, add_name=add_name, threads=1, batchSize=1, save_root=save_root, disc_scale=disc_scale)
 
 
 if __name__ == '__main__':
@@ -98,8 +112,17 @@ if __name__ == '__main__':
 #     predict_SVOS(params='RANet_video_single.pth', dataset='16val', save_root='../predictions/RANet_Video_16val')
 
     # predict_SVOS(params='RANet_image_single.pth', dataset='16all', save_root='../predictions/RANet_Image_16all')
+    
+    #RANet_video_multi.pth
+    model_path = 'RANet_video_multi_IOU_trnsfm_disc_scale05_nms_best_model_epoch0.pth'
+    save_root='../predictions/RANet_Video_17test_dev_IOU_trnsfm_disc_scale05'
+    with open("./logs/run2.txt", 'w+') as f:
+        f.write("loaded model: {} and saving images in: {}".format(model_path,save_root))
+    disc_scale = 0.5
+    apply_nms = False
+    print("using model:",model_path, "disc_scale:", disc_scale)
+    predict_SVOS(params=model_path, dataset='17test_dev', save_root=save_root, disc_scale=disc_scale)
 
-    predict_SVOS(params='RANet_video_multi.pth', dataset='17val', save_root='../predictions/RANet_Video_17val')
 
     # predict_SVOS(params='RANet_video_multi.pth', dataset='17test_dev', save_root='../predictions/RANet_Video_17test_dev')
 

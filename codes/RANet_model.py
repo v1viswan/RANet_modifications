@@ -10,11 +10,37 @@ from numpy.random import normal
 from numpy.linalg import svd
 from math import sqrt
 from torch.nn import functional as f
+from torch.nn import functional as F
 from torch.autograd import Variable
 import random
 from torch.nn import DataParallel as DP
 from RANet_lib.RANet_Model_imagenet import *
 import time
+
+def nms_excitation(score_map, excitation_score=0.5, threshold=0.8, window_size=1):
+    '''
+    score_map must be of dimension Batch_size x Num_channels x WxH.
+    nms is applied on WxH map of each channel
+    window_size is the size to look out for nms on each side of a pixel
+    It will use zero_padding
+    '''
+    max_values = F.max_pool2d(score_map,kernel_size=(2*window_size)+1, stride=1, padding=window_size)
+    nms = (score_map==max_values).float() * excitation_score*score_map.ge(threshold).float()
+    return score_map + nms
+
+class Interpolate_module(nn.Module):
+    def __init__(self, size=None, scale_factor=None, mode='bilinear', align_corners=False):
+        super(Interpolate_module, self).__init__()
+        self.interp = nn.functional.interpolate
+        self.size = size
+        self.scale_factor = scale_factor
+        self.mode = mode
+        self.align_corners = align_corners
+        
+    def forward(self, x):
+        x = self.interp(x, size=self.size, scale_factor=self.scale_factor, mode=self.mode, align_corners=self.align_corners)
+        return x
+
 
 def make_layer2(input_feature, out_feature, up_scale=1, ksize=3, d=1, groups=1):
     p = int((ksize - 1) / 2)
@@ -28,7 +54,8 @@ def make_layer2(input_feature, out_feature, up_scale=1, ksize=3, d=1, groups=1):
         nn.InstanceNorm2d(input_feature),
         nn.ReLU(),
         nn.Conv2d(input_feature, out_feature, ksize, padding=p),
-        nn.UpsamplingBilinear2d(scale_factor=up_scale),
+        Interpolate_module(scale_factor=up_scale, mode='bilinear', align_corners=True),
+#         nn.UpsamplingBilinear2d(scale_factor=up_scale),
     )
 
 class ResBlock2(nn.Module):
@@ -106,8 +133,13 @@ class MS_Block(nn.Module):
 
 
 class RANet(ResNet101):
-    def __init__(self, with_relu=0, pretrained=True, type='single_object'):
+    def __init__(self, with_relu=0, pretrained=True, type='single_object', apply_nms=False):
         super(RANet, self).__init__(with_relu=with_relu, pretrained=pretrained)
+        #########################################
+        self.vj_count = 0
+        self.apply_nms = apply_nms
+        #########################################
+        
         self.fp16 = False
         self.net_type = type
         self._init_net()
@@ -134,11 +166,13 @@ class RANet(ResNet101):
                                 make_layer2(128, 64),
                                 MS_Block(64, 32, d=[1,3,6]),
                                 ResBlock2(32, 16),
-                                nn.UpsamplingBilinear2d(scale_factor=2))
+                                Interpolate_module(scale_factor=2, mode='bilinear', align_corners=True))
+#                                 nn.UpsamplingBilinear2d(scale_factor=2))
         self.R3 = nn.Sequential(make_layer2(32 + 64, 64),
                                 make_layer2(64, 32),
                                 MS_Block(32, 16, d=[1,3,6]),
-                                nn.UpsamplingBilinear2d(scale_factor=2),
+                                Interpolate_module(scale_factor=2, mode='bilinear', align_corners=True),
+#                                 nn.UpsamplingBilinear2d(scale_factor=2),
                                 ResBlock2(16, 8),
                                 nn.Conv2d(16, 1, 3, padding=1)
                                 )
@@ -146,7 +180,8 @@ class RANet(ResNet101):
                                 make_layer2(256, 256),
                                 MS_Block(256, 128, d=[1,3,6]),
                                 ResBlock2(128, 64),
-                                nn.UpsamplingBilinear2d(scale_factor=2))
+                                Interpolate_module(scale_factor=2, mode='bilinear', align_corners=True))
+#                                 nn.UpsamplingBilinear2d(scale_factor=2))
         self.L4 = make_layer2(1024, 256, ksize=3)
         self.L5 = make_layer2(2048, 512, ksize=3)
         self.L3 = make_layer2(512, 128, ksize=3)
@@ -227,7 +262,7 @@ class RANet(ResNet101):
         return M
 
     def bbox_uncrop(img, bbox, size, crop_size):  # 4D input
-        img = F.upsample_bilinear(img, size=crop_size[2::])
+        img = F.interpolate(img, size=crop_size[2::], mode='bilinear', align_corners=True)
         msk = F.pad(img, (bbox[1], 864 - bbox[3], bbox[0], 480 - bbox[2],))
         return msk
 
@@ -238,7 +273,7 @@ class RANet(ResNet101):
             base_features2 = self.res_forward(x2)
             Kernel_3 = f.normalize(f.max_pool2d(self.L3(base_features2[2]), 2))
             Kernel_4 = f.normalize(self.L4(base_features2[3]))
-            Kernel_5 = f.normalize(f.upsample(self.L5(base_features2[4]), scale_factor=2, mode='bilinear'))
+            Kernel_5 = f.normalize(f.interpolate(self.L5(base_features2[4]), scale_factor=2, mode='bilinear'))
             Kernel_tmp = f.normalize(self.L_g(torch.cat([Kernel_3, Kernel_4, Kernel_5], dim=1)))
             if mode == 'encoder':
                 return [Kernel_tmp]
@@ -251,7 +286,7 @@ class RANet(ResNet101):
         base_features1 = self.res_forward(x1)
         Feature_3 = f.normalize(f.max_pool2d(self.L3(base_features1[2]), 2))
         Feature_4 = f.normalize(self.L4(base_features1[3]))
-        Feature_5 = f.normalize(f.upsample(self.L5(base_features1[4]), scale_factor=2, mode='bilinear'))
+        Feature_5 = f.normalize(f.interpolate(self.L5(base_features1[4]), scale_factor=2, mode='bilinear'))
         Feature = f.normalize(self.L_g(torch.cat([Feature_3, Feature_4, Feature_5], dim=1)))
 
         '''
@@ -294,8 +329,8 @@ class RANet(ResNet101):
         corr_b = torch.cat([co.index_select(0, m_sort[0, 0:256]).unsqueeze(0) for co, m_sort in zip(corr_b, m_sorted_idx)])
         # corr_b = corr_b[0].index_select(0, m_sorted_idx[0, 0, 0:256]).unsqueeze(0)
         # Merge net
-        fcorr = self.p_2(self.res_1(self.p_1(f.upsample(corr, scale_factor=2, mode='bilinear'))))
-        fcorr_b = self.p_2(self.res_1(self.p_1(f.upsample(corr_b, scale_factor=2, mode='bilinear'))))
+        fcorr = self.p_2(self.res_1(self.p_1(f.interpolate(corr, scale_factor=2, mode='bilinear'))))
+        fcorr_b = self.p_2(self.res_1(self.p_1(f.interpolate(corr_b, scale_factor=2, mode='bilinear'))))
 
         # Decoder
         base1 = torch.cat([self.ls13(base_features1[2]),
@@ -321,7 +356,7 @@ class RANet(ResNet101):
         out = [out_R]
         return out, features
 
-    def RANet_Multiple_forward_eval(self, x1, Ker, msk2, msk_p, mode=''):  # vxd  feature * msk *2  _feature_Rf
+    def RANet_Multiple_forward_eval(self, x1, Ker, msk2, msk_p, mode='', disc_scale=0):  # vxd  feature * msk *2  _feature_Rf
         if mode == 'first':
             # Exact template features
             x2 = Ker
@@ -330,9 +365,11 @@ class RANet(ResNet101):
             Kernel_4 = f.normalize(self.L4(base_features2[3]))
             Kernel_5 = f.normalize(f.interpolate(self.L5(base_features2[4]), scale_factor=2, mode='bilinear'))
             Kernel_tmp = f.normalize(self.L_g(torch.cat([Kernel_3, Kernel_4, Kernel_5], dim=1)))
-            Kernel_tmp = f.avg_pool2d(Kernel_tmp, 2)
+
+#             Kernel_tmp = f.avg_pool2d(Kernel_tmp, 2)
             return [Kernel_tmp]
         # Current frame feature
+#         print("getting input count:", 
         base_features1 = self.res_forward(x1)
         Feature_3 = f.normalize(f.max_pool2d(self.L3(base_features1[2]), 2))
         Feature_4 = f.normalize(self.L4(base_features1[3]))
@@ -367,13 +404,16 @@ class RANet(ResNet101):
             Mp_all = mp.ge(1.5).float()
 
             # Correlation
+            W0, H0 = ker.size()[-2::]
+            W,H = feature.size()[-2::]
+            
             Corr_subs = []
             ker_R = self.to_kernel(ker)
             corr_R = self.correlate(ker_R, feature)
-            self_corr_R = self.correlate(ker_R, ker)
+            template_corr = self.correlate(ker_R, ker) # Size W0xH0xW0*H0
 
             # Ranking attention scores
-            T_corr = f.max_pool2d(corr_R, 2).view(-1, 405, 405).transpose(1, 2).view(-1, 405, 15, 27)
+            T_corr = f.max_pool2d(corr_R, 2).view(-1, W0*H0, W*H//4).transpose(1, 2).view(-1,  W*H//4, W0, H0)
             R_map = f.relu(self.Ranking(T_corr)) * 0.2
             Rmaps = []
 
@@ -381,48 +421,37 @@ class RANet(ResNet101):
                 m2_rep = f.adaptive_avg_pool2d(M2s[idy], ker.size()[-2::])
                 corr_sub = m2_rep.view(m2_rep.size()[0], -1, 1, 1) * corr_R
                 Corr_subs.append(corr_sub)
-                Rmaps.append((R_map * m2_rep).view(-1, 1, 405))
+                Rmaps.append((R_map * m2_rep).view(-1, 1, W0*H0))
 
             Outs = []
             for idy in range(1, max_obj):  # training:with_bg, testing: w/o BG
                 corr = Corr_subs[idy]
                 co_size = Corr_subs[idy].size()[2::]
                 max_only, indices = f.max_pool2d(corr, co_size, return_indices=True)
-                max_only = max_only.view(-1, 1, 405) + Rmaps[idy]
+                max_only = max_only.view(-1, 1, W0*H0) + Rmaps[idy]
+                                
+                # Find correlation of a template FB pixel with other FB/BG pixels.
+                # For more correlation to FB pixel, +ve score, and -ve score for BG correlation
+                # For each pixel, take top 9 similar pixels
+                pixel_cnt = 9
+                temp_corr = template_corr * m2_rep.view(1,W0*H0,1,1)
+                FG_disc_score = (temp_corr*m2_rep).reshape(1,W0*H0,W0*H0)
+                FG_disc_score, _ = FG_disc_score.sort(descending=True,dim=2)
+                FG_disc_score = FG_disc_score[:,:,:pixel_cnt]
+                FG_disc_score = FG_disc_score.sum(dim=2)/(pixel_cnt)
+                                                          
+                FG_neg_score = (temp_corr*(1-m2_rep)).reshape(1,W0*H0,W0*H0)
+                FG_neg_score, _ = FG_neg_score.sort(descending=True, dim=2)
+                FG_neg_score = FG_neg_score[:,:,:pixel_cnt]
+                FG_neg_score = FG_neg_score.sum(dim=2)/(pixel_cnt)
+                FG_disc_score -= FG_neg_score/2
                 
+                max_only = max_only + FG_disc_score.view(-1,1,W0*H0)*disc_scale
+                ###################### Done discriminant score for FG
                 
-                
-                #### For FG, adjust scores based on how close a pixel is to rest of the FG pixes and far away from BG pixels
-                # Self correlation is of size: batch_size x W*H x W x H
-                # We want the final score to be a score on each pixel and thus of dimension: batch_size x W*H x 1 x 1
-                # Notation meaning: FG_BG: For WxH map with FG pixels, the channels have non zerovalue where 
-                #                   channel id corresponds to BG != 0
-                m2_rep = f.adaptive_avg_pool2d(M2s[idy], ker.size()[-2::])
-                
-                FG_FG = []
-                FG_BG = []
-                BG_BG = []
-                BG_FG = []
-                for b_iter in range(m2_rep.shape[0]):
-                    FG_FG.append(self.correlate(m2_rep[b_iter].view(-1, 1, 1, 1),m2_rep[b_iter:b_iter+1]))
-                    FG_BG.append(self.correlate(1-m2_rep[b_iter].view(-1, 1, 1, 1),m2_rep[b_iter:b_iter+1]))
-                    BG_FG.append(self.correlate(m2_rep[b_iter].view(-1, 1, 1, 1), 1-m2_rep[b_iter:b_iter+1]))
-                    BG_BG.append(self.correlate(1-m2_rep[b_iter].view(-1, 1, 1, 1),1-m2_rep[b_iter:b_iter+1]))
-                FG_FG = torch.cat(FG_FG,dim=0)
-                FG_BG = torch.cat(FG_BG,dim=0)
-                BG_FG = torch.cat(BG_FG,dim=0)
-                BG_BG = torch.cat(BG_BG,dim=0)
-                
-                # Score addition for machting to FG a lot and penalty for matching to BG
-                # We are computing FG discriminant score
-                # For each pixel in WxH, we can take max or average across non zero channels
-                FG_disc_score = f.avg_pool2d(FG_FG * self_corr_R, self_corr_R.size()[2::]).view(-1, 1, 405)/\
-                        (f.avg_pool2d(FG_FG , self_corr_R.size()[2::]).view(-1, 1, 405) + 0.000001)
-                scale_factor = 0.75
-                FG_disc_score -= f.max_pool2d(BG_FG * self_corr_R, self_corr_R.size()[2::]).view(-1, 1, 405)*scale_factor
-                
-                max_only = max_only + FG_disc_score
-                #########  Addition by VJ done #################
+                if self.apply_nms:
+                    max_only = nms_excitation(max_only, window_size=1)
+                ###################### NMS excitation applied if needed
                 
                 # Rank & select FG
                 m_sorted, m_sorted_idx = max_only.sort(descending=True, dim=2)
@@ -433,7 +462,7 @@ class RANet(ResNet101):
                     print('missing obj')
                     corr_backs = torch.zeros(corr_fores.size()).cuda()
                 else:
-                    '''
+                    ''' Shown equivalent
                     backs_idx = Corr_subs[0:idy] + Corr_subs[idy + 1::]
                     corr_b = torch.cat(backs_idx, 1)
                     R_map_b = Rmaps[0:idy] + Rmaps[idy + 1::]
@@ -441,20 +470,32 @@ class RANet(ResNet101):
                     '''
                     m2_rep = f.adaptive_avg_pool2d(M2s[idy], ker.size()[-2::])
                     corr_b = (1-m2_rep.view(m2_rep.size()[0], -1, 1, 1) )* corr_R
-                    R_map_b = (R_map * (1-m2_rep)).view(-1, 1, 405)
+                    R_map_b = (R_map * (1-m2_rep)).view(-1, 1, W0*H0)
                     ########## Above added by VJ ###########
                     
                     max_only_b, indices = f.max_pool2d(corr_b, co_size, return_indices=True)
                     max_only_b = max_only_b.view(R_map_b.size()[0], 1, -1) + R_map_b
-                    
-                    ########################################### VJ
-                    BG_disc_score = f.avg_pool2d(BG_BG * self_corr_R, self_corr_R.size()[2::]).view(-1, 1, 405)/\
-                        (f.avg_pool2d(FG_FG , self_corr_R.size()[2::]).view(-1, 1, 405) + 0.000001)
-                    scale_factor = 0.75
-                    BG_disc_score -= f.max_pool2d(FG_BG * self_corr_R, self_corr_R.size()[2::]).view(-1, 1, 405)*scale_factor
+                                    
+                    # Find correlation of a template BG pixel with other FB/BG pixels.
+                    # For more correlation to BG pixel, +ve score, and -ve score for FG correlation
+                    # For each pixel, take top 9 similar pixels
+                    temp_corr = template_corr * (1-m2_rep.view(1,W0*H0,1,1))
+                    BG_disc_score = (temp_corr*(1-m2_rep)).reshape(1,W0*H0,W0*H0)
+                    BG_disc_score, _ = BG_disc_score.sort(descending=True, dim=2)
+                    BG_disc_score = BG_disc_score[:,:,:pixel_cnt]
+                    BG_disc_score = BG_disc_score.sum(dim=2)/(pixel_cnt)
                 
-                    max_only_b = max_only_b + BG_disc_score
-                    ############################################ VJ
+                    BG_neg_score = (temp_corr*m2_rep).reshape(1,W0*H0,W0*H0)
+                    BG_neg_score, _ = BG_neg_score.sort(descending=True, dim=2)
+                    BG_neg_score = BG_neg_score[:,:,:pixel_cnt]
+                    BG_neg_score = BG_neg_score.sum(dim=2)/(pixel_cnt)
+                    BG_disc_score -= BG_neg_score/2
+                    max_only_b = max_only_b + BG_disc_score.view(-1,1,W0*H0)*disc_scale
+                    ###################### Done discriminant score for BG
+                    
+                    if self.apply_nms:
+                        max_only = nms_excitation(max_only_b, window_size=1)
+                    ###################### NMS excitation applied if needed
                     
                     # Rank & select BG
                     m_sorted, m_sorted_idx = max_only_b.sort(descending=True, dim=2)
@@ -477,46 +518,32 @@ class RANet(ResNet101):
                 base3 = torch.cat([basef3[idx: idx + 1],
                                    fea2], 1)
                 fea3 = self.R3(base3)
-                out = f.sigmoid(fea3)
+                out = torch.sigmoid(fea3)
                 Outs.append(out)
             Out = torch.cat(Outs, 1)
             Out_Rs.append(Out)
         features = []
         out = [Out_Rs]
         return out, features
+    
+    def RANet_Multiple_forward_train(self, template, target, template_msk, target_msk, prev_mask = None,disc_scale=0):
 
-    def RANet_Multiple_forward_train(self, x1, Ker, msk2, msk_p, mode=''):  # vxd  feature * msk *2  _feature_Rf
-        '''
-        From training pass, what we want are:
-        1. Final predicted masks, to do cross entropy loss with target masks
-        2. Self correlation matrix (With features) and self mask correlation (FG vs FG , FGvsBG for each object in a frame).
-            This is to compute the loss for FG features not close to each other and FG features close to BG
-        3. Target correlation matrix (With features) and target mask correlation (FG vs FG , FGvsBG for each object in 
-            a frame). This is to compute the loss for FG features not close to each other and FG features close to BG
-        4. Correlation matrix with target frame and mask correlation matrix with target frame (FG vs FG , FGvsBG for each
-            object in a frame). This is again to compute the loss for FG features not close to each other and FG features
-            close to BG
-        
-        1 is expected to update mask prediction network more and 2,3 & 4 are expected to update feature extraction network
-        '''
-        if mode == 'first':
-            # Exact template features
-            x2 = Ker
-            base_features2 = self.res_forward(x2)
-            Kernel_3 = f.normalize(f.max_pool2d(self.L3(base_features2[2]), 2))
-            Kernel_4 = f.normalize(self.L4(base_features2[3]))
-            Kernel_5 = f.normalize(f.interpolate(self.L5(base_features2[4]), scale_factor=2, mode='bilinear'))
-            Kernel_tmp = f.normalize(self.L_g(torch.cat([Kernel_3, Kernel_4, Kernel_5], dim=1)))
+        # Exact template features
+        x2 = template
+        base_features2 = self.res_forward(x2)
+        Kernel_3 = f.normalize(f.max_pool2d(self.L3(base_features2[2]), 2))
+        Kernel_4 = f.normalize(self.L4(base_features2[3]))
+        Kernel_5 = f.normalize(f.interpolate(self.L5(base_features2[4]), scale_factor=2, mode='bilinear'))
+        Kernel_tmp = f.normalize(self.L_g(torch.cat([Kernel_3, Kernel_4, Kernel_5], dim=1)))
 #             Kernel_tmp = f.avg_pool2d(Kernel_tmp, 2)
-            return [Kernel_tmp]
+
         # Current frame feature
-        base_features1 = self.res_forward(x1)
+        base_features1 = self.res_forward(target)
         Feature_3 = f.normalize(f.max_pool2d(self.L3(base_features1[2]), 2))
         Feature_4 = f.normalize(self.L4(base_features1[3]))
         Feature_5 = f.normalize(f.interpolate(self.L5(base_features1[4]), scale_factor=2, mode='bilinear'))
         Feature = f.normalize(self.L_g(torch.cat([Feature_3, Feature_4, Feature_5], dim=1)))
 
-        Kernel_tmp = Ker
         Out_Rs = []
 
         basef1 = torch.cat([self.ls13(base_features1[2]),
@@ -528,123 +555,121 @@ class RANet(ResNet101):
         basef3 = torch.cat([self.ls31(base_features1[0]),
                             self.ls32(base_features1[1]),
                             self.ls33(base_features1[2])], 1)
-        
-        train_op_per_sample = []
+
         for idx in range(len(Feature)):  # batch
             ker = Kernel_tmp[idx: idx + 1]
             feature = Feature[idx: idx + 1]
-            m2 = msk2[idx: idx + 1]
-            mp = msk_p[idx: idx + 1]
+            m2 = template_msk[idx: idx + 1]
+            
+            if (prev_mask is not None):
+                mp = prev_mask[idx:idx+1]
+            else:
+                mp = template_msk[idx: idx + 1]
+                
             max_obj = m2.max().int().data.cpu().numpy()
             if max_obj < 2:
                 m2[0, 0, 0, 0] = 2
                 max_obj = m2.max().int().data.cpu().numpy()
             M2s = self.P2masks(f.relu(m2 - 1), max_obj - 1)
-            M2_all = m2.ge(1.5).float()
+#             M2_all = m2.ge(1.5).float()
             Mps = self.P2masks(f.relu(mp - 1), max_obj - 1)
-            Mp_all = mp.ge(1.5).float()
+#             Mp_all = mp.ge(1.5).float()
 
             # Correlation
-            Corr_subs = []
-            ker_R = self.to_kernel(ker) ### Will be of size W0*H0x512x1x1
-            corr_R = self.correlate(ker_R, feature) #### Will be of size 1xW0*H0xWxH
-            self_corr_R = self.correlate(ker_R, ker) #### Will be of size 1xW0*H0xW0xH0
-
-            # Ranking attention scores
             W0, H0 = ker.size()[-2::]
             W,H = feature.size()[-2::]
-            T_corr = corr_R.view(-1, W0*H0, W*H).transpose(1, 2).view(-1, W*H, W0, H0)
-            R_map = f.relu(self.Ranking(T_corr)) * 0.2
-            Rmaps = []
+            
+#             Corr_subs = []
+            ker_R = self.to_kernel(ker)
+            corr_R = self.correlate(ker_R, feature)
+            template_corr = self.correlate(ker_R, ker) # Size W0xH0xW0*H0
 
-            for idy in range(max_obj):  # make corrs (backgrounds(=1) and objs)
-                m2_rep = f.adaptive_avg_pool2d(M2s[idy], ker.size()[-2::])
-                corr_sub = m2_rep.view(m2_rep.size()[0], -1, 1, 1) * corr_R
-                Corr_subs.append(corr_sub)
-                Rmaps.append((R_map * m2_rep).view(-1, 1, W0*H0))
+            # Ranking attention scores
+            T_corr = f.max_pool2d(corr_R, 2).view(-1, W0*H0, W*H//4).transpose(1, 2).view(-1,  W*H//4, W0, H0)
+            R_map = f.relu(self.Ranking(T_corr)) * 0.2
 
             Outs = []
             for idy in range(1, max_obj):  # training:with_bg, testing: w/o BG
-                corr = Corr_subs[idy]
-                co_size = Corr_subs[idy].size()[2::]
-                max_only, indices = f.max_pool2d(corr, co_size, return_indices=True)
-                max_only = max_only.view(-1, 1, W0*H0) + Rmaps[idy]
-                
-                
-                
-                #### For FG, adjust scores based on how close a pixel is to rest of the FG pixes and far away from BG pixels
-                # Self correlation is of size: batch_size x W*H x W x H
-                # We want the final score to be a score on each pixel and thus of dimension: batch_size x W*H x 1 x 1
-                # Notation meaning: FG_BG: For WxH map with FG pixels, the channels have non zerovalue where 
-                #                   channel id corresponds to BG != 0
                 m2_rep = f.adaptive_avg_pool2d(M2s[idy], ker.size()[-2::])
+                corr = m2_rep.view(m2_rep.size()[0], -1, 1, 1) * corr_R
+                co_size = corr.size()[2::]
+                max_only, indices = f.max_pool2d(corr, co_size, return_indices=True)
+                R_map = max_only*0
+                max_only = max_only.view(-1, 1, W0*H0) + (R_map * m2_rep).view(-1, 1, W0*H0)
                 
-                FG_FG = []
-                FG_BG = []
-                BG_BG = []
-                BG_FG = []
-                for b_iter in range(m2_rep.shape[0]):
-                    FG_FG.append(self.correlate(m2_rep[b_iter].view(-1, 1, 1, 1),m2_rep[b_iter:b_iter+1]))
-                    FG_BG.append(self.correlate(1-m2_rep[b_iter].view(-1, 1, 1, 1),m2_rep[b_iter:b_iter+1]))
-                    BG_FG.append(self.correlate(m2_rep[b_iter].view(-1, 1, 1, 1), 1-m2_rep[b_iter:b_iter+1]))
-                    BG_BG.append(self.correlate(1-m2_rep[b_iter].view(-1, 1, 1, 1),1-m2_rep[b_iter:b_iter+1]))
-                FG_FG = torch.cat(FG_FG,dim=0)
-                FG_BG = torch.cat(FG_BG,dim=0)
-                BG_FG = torch.cat(BG_FG,dim=0)
-                BG_BG = torch.cat(BG_BG,dim=0)
                 
-                # Score addition for machting to FG a lot and penalty for matching to BG
-                # We are computing FG discriminant score
-                # For each pixel in WxH, we can take max or average across non zero channels
-                FG_disc_score = f.avg_pool2d(FG_FG * self_corr_R, self_corr_R.size()[2::]).view(-1, 1, 405)/\
-                        (f.avg_pool2d(FG_FG , self_corr_R.size()[2::]).view(-1, 1, 405) + 0.000001)
-                scale_factor = 0.75
-                FG_disc_score -= f.max_pool2d(BG_FG * self_corr_R, self_corr_R.size()[2::]).view(-1, 1, 405)*scale_factor
+                # Find correlation of a template FB pixel with other FB/BG pixels.
+                # For more correlation to FB pixel, +ve score, and -ve score for BG correlation
+                # For each pixel, take top 9 similar pixels
+                pixel_cnt = 9
+                temp_corr = template_corr * m2_rep.view(1,W0*H0,1,1)
+                FG_disc_score = (temp_corr*m2_rep).reshape(1,W0*H0,W0*H0)
+                FG_disc_score, _ = FG_disc_score.sort(descending=True,dim=2)
+                FG_disc_score = FG_disc_score[:,:,:pixel_cnt]
+                FG_disc_score = FG_disc_score.sum(dim=2)/(pixel_cnt)
+                                                          
+                FG_neg_score = (temp_corr*(1-m2_rep)).reshape(1,W0*H0,W0*H0)
+                FG_neg_score, _ = FG_neg_score.sort(descending=True, dim=2)
+                FG_neg_score = FG_neg_score[:,:,:pixel_cnt]
+                FG_neg_score = FG_neg_score.sum(dim=2)/(pixel_cnt)
+                FG_disc_score -= FG_neg_score/2
                 
-                max_only = max_only + FG_disc_score
-                #########  Addition by VJ done #################
+                max_only = max_only + FG_disc_score.view(-1,1,W0*H0)*disc_scale
+                ###################### Done discriminant score for FG
+                
+                if self.apply_nms:
+                    max_only = nms_excitation(max_only, window_size=1)
+                ###################### NMS excitation applied if needed
                 
                 # Rank & select FG
                 m_sorted, m_sorted_idx = max_only.sort(descending=True, dim=2)
                 corr = torch.cat([co.index_select(0, m_sort[0, 0:256]).unsqueeze(0) for co, m_sort in zip(corr, m_sorted_idx)])
                 # Merge net FG
-                corr_fores = self.p_2(self.res_1(self.p_1(corr)))
+                corr_fores = self.p_2(self.res_1(self.p_1(f.interpolate(corr, scale_factor=2, mode='bilinear'))))
                 if max_obj == 1:  # only bg
                     print('missing obj')
                     corr_backs = torch.zeros(corr_fores.size()).cuda()
                 else:
-                    '''
-                    backs_idx = Corr_subs[0:idy] + Corr_subs[idy + 1::]
-                    corr_b = torch.cat(backs_idx, 1)
-                    R_map_b = Rmaps[0:idy] + Rmaps[idy + 1::]
-                    R_map_b = torch.cat(R_map_b, 2)
-                    '''
+
                     m2_rep = f.adaptive_avg_pool2d(M2s[idy], ker.size()[-2::])
                     corr_b = (1-m2_rep.view(m2_rep.size()[0], -1, 1, 1) )* corr_R
-                    R_map_b = (R_map * (1-m2_rep)).view(-1, 1, 405)
+                    R_map_b = (R_map * (1-m2_rep)).view(-1, 1, W0*H0)
                     ########## Above added by VJ ###########
                     
                     max_only_b, indices = f.max_pool2d(corr_b, co_size, return_indices=True)
-                    max_only_b = max_only_b.view(R_map_b.size()[0], 1, -1) + R_map_b
-                    
-                    ########################################### VJ
-                    BG_disc_score = f.avg_pool2d(BG_BG * self_corr_R, self_corr_R.size()[2::]).view(-1, 1, 405)/\
-                        (f.avg_pool2d(FG_FG , self_corr_R.size()[2::]).view(-1, 1, 405) + 0.000001)
-                    scale_factor = 0.75
-                    BG_disc_score -= f.max_pool2d(FG_BG * self_corr_R, self_corr_R.size()[2::]).view(-1, 1, 405)*scale_factor
+                    max_only_b = max_only_b.view(-1, 1, W0*H0) + R_map_b ###
+                                    
+                    # Find correlation of a template BG pixel with other FB/BG pixels.
+                    # For more correlation to BG pixel, +ve score, and -ve score for FG correlation
+                    # For each pixel, take top 9 similar pixels
+                    temp_corr = template_corr * (1-m2_rep.view(1,W0*H0,1,1))
+                    BG_disc_score = (temp_corr*(1-m2_rep)).reshape(1,W0*H0,W0*H0)
+                    BG_disc_score, _ = BG_disc_score.sort(descending=True, dim=2)
+                    BG_disc_score = BG_disc_score[:,:,:pixel_cnt]
+                    BG_disc_score = BG_disc_score.sum(dim=2)/(pixel_cnt)
                 
-                    max_only_b = max_only_b + BG_disc_score
-                    ############################################ VJ
+                    BG_neg_score = (temp_corr*m2_rep).reshape(1,W0*H0,W0*H0)
+                    BG_neg_score, _ = BG_neg_score.sort(descending=True, dim=2)
+                    BG_neg_score = BG_neg_score[:,:,:pixel_cnt]
+                    BG_neg_score = BG_neg_score.sum(dim=2)/(pixel_cnt)
+                    BG_disc_score -= BG_neg_score/2
+                    max_only_b = max_only_b + BG_disc_score.view(-1,1,W0*H0)*disc_scale
+                    ###################### Done discriminant score for BG
                     
+                    if self.apply_nms:
+                        max_only = nms_excitation(max_only_b, window_size=1)
+                    ###################### NMS excitation applied if needed
+
                     # Rank & select BG
                     m_sorted, m_sorted_idx = max_only_b.sort(descending=True, dim=2)
                     corr_b = torch.cat([co.index_select(0, m_sort[0, 0:256]).unsqueeze(0) for co, m_sort in zip(corr_b, m_sorted_idx)])
                     # Merge net BG
-                    corr_backs = self.p_2(self.res_1(self.p_1(corr_b)))
+                    corr_backs = self.p_2(self.res_1(self.p_1(f.interpolate(corr_b, scale_factor=2, mode='bilinear'))))
                 if idy == 0:
                     tmp = corr_fores
                     corr_fores = corr_backs
                     corr_backs = tmp
+                    print("Don't come here!!!2")
                     m_p = f.adaptive_avg_pool2d(Mp_all, corr_fores.size()[-2::])
                 else:
                     m_p = f.adaptive_avg_pool2d(Mps[idy], corr_fores.size()[-2::])
@@ -657,10 +682,145 @@ class RANet(ResNet101):
                 base3 = torch.cat([basef3[idx: idx + 1],
                                    fea2], 1)
                 fea3 = self.R3(base3)
-                out = f.sigmoid(fea3)
+                out = fea3 #torch.sigmoid(fea3)
+                ### For each object in the image, create an out map and append it to Outs
                 Outs.append(out)
             Out = torch.cat(Outs, 1)
+            ############### Once we have out map for all objects in an image, append it to a per image list
             Out_Rs.append(Out)
         features = []
-        out = [Out_Rs]
-        return out, features
+        return Out_Rs, features
+
+    def RANet_Multiple_forward_train_mult_lvl(self, template, target, template_msk, target_msk, prev_mask = None):
+
+        # Exact template features
+        x2 = template
+        base_features2 = self.res_forward(x2)
+        Kernel_3 = f.normalize(f.max_pool2d(self.L3(base_features2[2]), 2))
+        Kernel_4 = f.normalize(self.L4(base_features2[3]))
+        Kernel_5 = f.normalize(f.interpolate(self.L5(base_features2[4]), scale_factor=2, mode='bilinear'))
+        Kernel_tmp = f.normalize(self.L_g(torch.cat([Kernel_3, Kernel_4, Kernel_5], dim=1)))
+#             Kernel_tmp = f.avg_pool2d(Kernel_tmp, 2)
+
+        # Current frame feature
+        base_features1 = self.res_forward(target)
+        Feature_3 = f.normalize(f.max_pool2d(self.L3(base_features1[2]), 2))
+        Feature_4 = f.normalize(self.L4(base_features1[3]))
+        Feature_5 = f.normalize(f.interpolate(self.L5(base_features1[4]), scale_factor=2, mode='bilinear'))
+        Feature = f.normalize(self.L_g(torch.cat([Feature_3, Feature_4, Feature_5], dim=1)))
+
+        Out_Rs = []
+
+        basef1 = torch.cat([self.ls13(base_features1[2]),
+                            self.ls14(base_features1[3]),
+                            self.ls15(base_features1[4]), ], 1)
+        basef2 = torch.cat([self.ls22(base_features1[1]),
+                            self.ls23(base_features1[2]),
+                            self.ls24(base_features1[3]), ], 1)
+        basef3 = torch.cat([self.ls31(base_features1[0]),
+                            self.ls32(base_features1[1]),
+                            self.ls33(base_features1[2])], 1)
+        
+        # For storing and using intermediate features
+        Feat_images_list =[]
+        for idx in range(len(Feature)):  # batch
+            
+            feat_per_img = []
+            
+            ker = Kernel_tmp[idx: idx + 1]
+            feature = Feature[idx: idx + 1]
+            m2 = template_msk[idx: idx + 1]
+            
+            if (prev_mask is not None):
+                mp = prev_mask[idx:idx+1]
+            else:
+                mp = template_msk[idx: idx + 1]
+                
+            max_obj = m2.max().int().data.cpu().numpy()
+            if max_obj < 2:
+                m2[0, 0, 0, 0] = 2
+                max_obj = m2.max().int().data.cpu().numpy()
+            M2s = self.P2masks(f.relu(m2 - 1), max_obj - 1)
+#             M2_all = m2.ge(1.5).float()
+            Mps = self.P2masks(f.relu(mp - 1), max_obj - 1)
+#             Mp_all = mp.ge(1.5).float()
+
+            # Correlation
+            W0, H0 = ker.size()[-2::]
+            W,H = feature.size()[-2::]
+            
+#             Corr_subs = []
+            ker_R = self.to_kernel(ker)
+            corr_R = self.correlate(ker_R, feature)
+
+            # Ranking attention scores
+            T_corr = f.max_pool2d(corr_R, 2).view(-1, W0*H0, W*H//4).transpose(1, 2).view(-1,  W*H//4, W0, H0)
+            R_map = f.relu(self.Ranking(T_corr)) * 0.2
+
+            Outs = []
+            for idy in range(1, max_obj):  # training:with_bg, testing: w/o BG
+                feat_per_obj = []
+                
+                m2_rep = f.adaptive_avg_pool2d(M2s[idy], ker.size()[-2::])
+                corr = m2_rep.view(m2_rep.size()[0], -1, 1, 1) * corr_R
+                co_size = corr.size()[2::]
+                max_only, indices = f.max_pool2d(corr, co_size, return_indices=True)
+                max_only = max_only.view(-1, 1, W0*H0) + (R_map * m2_rep).view(-1, 1, W0*H0)
+                
+                # Rank & select FG
+                m_sorted, m_sorted_idx = max_only.sort(descending=True, dim=2)
+                corr = torch.cat([co.index_select(0, m_sort[0, 0:256]).unsqueeze(0) for co, m_sort in zip(corr, m_sorted_idx)])
+                # Merge net FG
+                corr_fores = self.p_2(self.res_1(self.p_1(f.interpolate(corr, scale_factor=2, mode='bilinear'))))
+                if max_obj == 1:  # only bg
+                    print('missing obj')
+                    corr_backs = torch.zeros(corr_fores.size()).cuda()
+                else:
+
+                    m2_rep = f.adaptive_avg_pool2d(M2s[idy], ker.size()[-2::])
+                    corr_b = (1-m2_rep.view(m2_rep.size()[0], -1, 1, 1) )* corr_R
+                    R_map_b = (R_map * (1-m2_rep)).view(-1, 1, W0*H0)
+                    ########## Above added by VJ ###########
+                    
+                    max_only_b, indices = f.max_pool2d(corr_b, co_size, return_indices=True)
+                    max_only_b = max_only_b.view(-1, 1, W0*H0) + R_map_b ###
+
+                    # Rank & select BG
+                    m_sorted, m_sorted_idx = max_only_b.sort(descending=True, dim=2)
+                    corr_b = torch.cat([co.index_select(0, m_sort[0, 0:256]).unsqueeze(0) for co, m_sort in zip(corr_b, m_sorted_idx)])
+                    # Merge net BG
+                    corr_backs = self.p_2(self.res_1(self.p_1(f.interpolate(corr_b, scale_factor=2, mode='bilinear'))))
+                if idy == 0:
+                    tmp = corr_fores
+                    corr_fores = corr_backs
+                    corr_backs = tmp
+                    print("Don't come here!!!2")
+                    m_p = f.adaptive_avg_pool2d(Mp_all, corr_fores.size()[-2::])
+                else:
+                    m_p = f.adaptive_avg_pool2d(Mps[idy], corr_fores.size()[-2::])
+                # low level features
+                base1 = torch.cat([basef1[idx: idx + 1], corr_fores, corr_backs, m_p], 1)
+                
+                fea1 = self.R1(base1)
+                # 60 resolution feature
+                feat_per_obj.append(fea1)
+                
+                base2 = torch.cat([basef2[idx: idx + 1],
+                                   fea1], 1)
+                fea2 = self.R2(base2)
+                # 120 resolution feature
+                feat_per_obj.append(fea2)
+                
+                base3 = torch.cat([basef3[idx: idx + 1],
+                                   fea2], 1)
+                fea3 = self.R3(base3)
+                out = fea3 #torch.sigmoid(fea3)
+                ### For each object in the image, create an out map and append it to Outs
+                Outs.append(out)
+                feat_per_img.append(feat_per_obj)
+            Feat_images_list.append(feat_per_img)
+            Out = torch.cat(Outs, 1)
+            ############### Once we have out map for all objects in an image, append it to a per image list
+            Out_Rs.append(Out)
+        features = []
+        return Out_Rs, Feat_images_list

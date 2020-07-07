@@ -73,16 +73,20 @@ class DAVIS2017_loader(data.Dataset):
                     Set = '/trainval.txt'
                 elif DP['mode'] in ['test_dev', '17test_dev']:
                     Set = '/test-dev.txt'
+                elif DP['mode'] in ['test_chl', '17test_chl']:
+                    Set = '/test-challenge.txt'
                 elif DP['mode'] in ['17train']:
                     Set = '/train.txt'
                 with open(self.root + 'ImageSets/' + self.years + Set) as f:
                     SetsTxts = f.readlines()
+                    print("Number of files:", len(SetsTxts) )
                 # if DP['mode'] in ['all', 'online_all']:
                 #     with open(self.root + 'ImageSets/' + self.years + '/val.txt') as f:
                 #         SetsTxts2 = f.readlines()
                 #     SetsTxts = SetsTxts + SetsTxts2
                 Dirs = [self.root + 'JPEGImages/480p/' + name[0:-1] for name in SetsTxts]
                 Dirs.sort()
+                print("Dirs:", len(Dirs))
                 for dir in Dirs:
                     files = glob(dir + '/*.*')
                     files.sort()
@@ -102,10 +106,13 @@ class DAVIS2017_loader(data.Dataset):
                     if DP['reading_type'] != 'SVOS-YTB':
                         _mask = np.array(Image.open(Y_files[0]).convert("P"))
                         self.num_objects.append(np.max(_mask))
-                if DP['mode'] in ['train', '17train']:
+                if DP['mode'] in ['train']:#, '17train']:
+                    print("saving data in X_train")
                     X_train = X
                     y_train = Y
-                elif DP['mode'] in ['test', 'all', 'test_dev', '17test_dev', '16val', '17val', '16all', 'YTB18']:
+                elif DP['mode'] in ['test', 'all', 'test_dev', '17test_dev', '17test_chl', '16val', '17val',\
+                                    '16all', 'YTB18','17train']:
+                    print("saving data in X_test")
                     X_test = X
                     y_test = Y
                 datasets.append(
@@ -115,8 +122,8 @@ class DAVIS2017_loader(data.Dataset):
         self.transform = transform
         self.input_transform = input_transform
         self.target_transform = target_transform
-        self.centerCrop = CenterCrop((480, 864))
-        self.random_crop = RandomCrop((512, 960))
+#         self.centerCrop = CenterCrop((480, 864))
+#         self.random_crop = RandomCrop((512, 960))
         self.rand = rand
         self.in_type = in_type
         self.idx_0 = 0

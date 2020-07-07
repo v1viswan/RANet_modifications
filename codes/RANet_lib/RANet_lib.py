@@ -14,7 +14,8 @@ from torch.autograd import Variable
 from torch.utils.data import DataLoader
 from torch.nn import functional as F
 
-
+inSize1=480
+inSize2=864
 
 '''
 Functions for Checkpoints
@@ -46,21 +47,35 @@ def checkpoint_load(fpath, model=None):
         raise ValueError("=> No checkpoint found at '{}'".format(fpath))
 
 def msk2bbox(msk, k=1.5):
+    '''
+    msk should be 1xWxH
+    '''
     input_size = [480.0, 864.0]
+#     input_size = [float(inSize1), float(inSize2)]
     if torch.max(msk) == 0:
+#         return torch.from_numpy(np.asarray([0, 0, inSize1, inSize2]))
         return torch.from_numpy(np.asarray([0, 0, 480, 864]))
     p = float(input_size[0]) / input_size[1]
     msk_x = torch.max(msk[0], 1)[0]
     msk_y = torch.max(msk[0], 0)[0]
     nzx = torch.nonzero(msk_x)
     nzy = torch.nonzero(msk_y)
+    ## Find coordinates with pixels
     bbox_init = [(nzx[0] + nzx[-1]) / 2, (nzy[0] + nzy[-1]) / 2, (nzx[-1] - nzx[0]).float() * k / 2, (nzy[-1] - nzy[0]).float() * k / 2]
+    # The above selects a box which covers all non zero pixels, with box size = min_box_size * scale factor k * 0.5
+    # This is like the window size on both directions
+    # bbox_init coord is like: [ mid_x, mid_y, x_one_side_length, y_one_side_length]
     tmp = torch.max(bbox_init[2], p * bbox_init[3])
     bbox_init = [bbox_init[0], bbox_init[1], tmp.long(), (tmp / p).long()]
+    # The above adjusts box shape aspect ratio to the original aspect ratio, with no non zero pixel skipped
+    
     bbox = torch.cat([bbox_init[0] - bbox_init[2], bbox_init[1] - bbox_init[3], bbox_init[0] + bbox_init[2], bbox_init[1] + bbox_init[3]])
+    # makes dimention to be: [x_min, y_min, x_max, y_max] and Converts to a tensor
     bbox = torch.min(torch.max(bbox, torch.zeros(4).cuda().long()),
           torch.from_numpy(np.array([input_size[0], input_size[1], input_size[0], input_size[1]])).cuda().long())
+    # The above bounds the box to range [0, max_img_dim]
     if bbox[2] - bbox[0] < 32 or bbox[3] - bbox[1] < 32:
+#         return torch.from_numpy(np.asarray([0, 0, inSize1, inSize2])).cuda()
         return torch.from_numpy(np.asarray([0, 0, 480, 864])).cuda()
     return bbox
 
@@ -69,11 +84,12 @@ def bbox_crop(img, bbox):
     return img
 
 def bbox_uncrop(img, bbox, size, crop_size): # 4D input
-    img = F.upsample_bilinear(img, size=crop_size[2::])
+    img = F.interpolate(img, size=crop_size[2::], mode='bilinear',align_corners=True)
     msk = F.pad(img, (bbox[1], 864 - bbox[3], bbox[0], 480 - bbox[2], ))
+#     msk = F.pad(img, (bbox[1], inSize2 - bbox[3], bbox[0], inSize1 - bbox[2], ))
     return msk
 
-def test_SVOS_Video_batch(data_loader, model, save_root, threshold=0.5, single_object=False, pre_first_frame=False, add_name=''):
+def test_SVOS_Video_batch(data_loader, model, save_root, threshold=0.5, single_object=False, pre_first_frame=False, add_name='', disc_scale=0):
     ms = [864, 480]
     palette_path = '../datasets/palette.txt'
     with open(palette_path) as f:
@@ -92,35 +108,35 @@ def test_SVOS_Video_batch(data_loader, model, save_root, threshold=0.5, single_o
                             Img_flags=[[] for i in range(batchsize)])
         return Frames_batch
     batchsize = 4
-    max_iter = 5
+    max_iter = 4
     torch.set_grad_enabled(False)
     _ = None
     Frames_batch = init_Frame(batchsize)
-    print('Loading Data .........')
+    print('Loading Data ........., len:',len(data_loader))
     for iteration, batch in enumerate(data_loader, 1):
         if model.fp16:
-            batch[0] = [Variable(datas, volatile=True).cuda().half() for datas in batch[0]]
-            batch[1] = [Variable(datas, volatile=True).cuda().half() for datas in batch[1]]
+            batch[0] = [datas.cuda().half() for datas in batch[0]]
+            batch[1] = [datas.cuda().half() for datas in batch[1]]
         else:
-            batch[0] = [Variable(datas, volatile=True).cuda() for datas in batch[0]]
-            batch[1] = [Variable(datas, volatile=True).cuda() for datas in batch[1]]
+            batch[0] = [datas.cuda() for datas in batch[0]]
+            batch[1] = [datas.cuda() for datas in batch[1]]
         frame_num = len(batch[0])
         Key_frame = batch[0][0]
         init_Key_mask = batch[1][0]
         size = Key_frame.size()[2::]
         # cc for key frame
         bbox = msk2bbox(init_Key_mask[0].ge(1.6), k=1.5)
-        Key_frame = F.upsample(bbox_crop(Key_frame[0], bbox).unsqueeze(0), size, mode='bilinear')
-        Key_mask = F.upsample(bbox_crop(init_Key_mask[0], bbox).unsqueeze(0), size)
+        Key_frame = F.interpolate(bbox_crop(Key_frame[0], bbox).unsqueeze(0), size, mode='bilinear',align_corners=True)
+        Key_mask = F.interpolate(bbox_crop(init_Key_mask[0], bbox).unsqueeze(0), size)
         S_name = batch[2][0][0]
-        Key_feature = model(_, Key_frame, _, _, mode='first')[0]
+        Key_feature = model(_, Key_frame, _, _, mode='first', disc_scale=disc_scale)[0]
         Frames = batch[0]
         Img_sizes = batch[3]
 
         loc = np.argmin(Frames_batch['Sizes'][0:batchsize])
         Fsize = len(batch[2])
         # print(loc)
-        # print(Fsize)
+        print("folder:", S_name, "images:", len(batch[0]))
         Frames_batch['Frames'][loc].extend(Frames[1::])
         Frames_batch['Key_features'][loc].extend([Key_feature] + [None] * (Fsize - 2))
         Frames_batch['Key_masks'][loc].extend([Key_mask] * (Fsize - 1))
@@ -137,8 +153,9 @@ def test_SVOS_Video_batch(data_loader, model, save_root, threshold=0.5, single_o
             print("Sending first batch of images for prediction, iteration:", iteration)
             for idx in range(batchsize):
                 Frames_batch['Flags'][idx].append(False)
-            Frames_batch['Sizes'][batchsize] = min(Frames_batch['Sizes'][0:batchsize - 1])
-            Out_Mask = process_SVOS_batch(Frames_batch, model, threshold, single_object, pre_first_frame)
+            Frames_batch['Sizes'][batchsize] = min(Frames_batch['Sizes'][0:batchsize])# - 1])
+            Out_Mask = process_SVOS_batch(Frames_batch, model, threshold, single_object, pre_first_frame,\
+                                          disc_scale=disc_scale)
             Image_names = Frames_batch['Image_names']
             Img_sizes = Frames_batch['Img_sizes']
             Img_flags = Frames_batch['Img_flags']
@@ -149,7 +166,6 @@ def test_SVOS_Video_batch(data_loader, model, save_root, threshold=0.5, single_o
                     if not (os.path.exists(save_path)):
                         os.mkdir(save_path)
                     if flag == 1:
-                        print(folder_name)
                         I0 = Image.open(name)
                     if I0.size[0] > 864:
                         t = min(864.0 / I0.size[0], 480.0 / I0.size[1])
@@ -168,7 +184,8 @@ def test_SVOS_Video_batch(data_loader, model, save_root, threshold=0.5, single_o
     print("Done processing, imafes saved at path:", save_path)
     return
 
-def process_SVOS_batch(Frames_batch, model, threshold=0.5, single_object=False, pre_first_frame=False):
+def process_SVOS_batch(Frames_batch, model, threshold=0.5, single_object=False, pre_first_frame=False, disc_scale=0):
+    
     def msks2P(msks, objs_ids_num, fp16=False):
         P = torch.zeros(msks[0].size()).cuda()
         if fp16:
@@ -180,18 +197,21 @@ def process_SVOS_batch(Frames_batch, model, threshold=0.5, single_object=False, 
         if len(msks) == objs_ids_num:
             return P + 1
         return P
-    Frames = Frames_batch['Frames']
-    Key_features = Frames_batch['Key_features']
-    Init_masks = Frames_batch['Init_Key_masks']
-    Key_masks = Frames_batch['Key_masks']
-    Boxs = Frames_batch['Box']
-    # Image_names = Frames_batch['Image_names']
-    batchsize = Frames_batch['batchsize']
+    Frames = [x for x in Frames_batch['Frames'] if x != []]
+    Key_features = [x for x in Frames_batch['Key_features'] if x != []]
+    Init_masks = [x for x in Frames_batch['Init_Key_masks'] if x != []]
+    Key_masks = [x for x in Frames_batch['Key_masks'] if x != []]
+    Boxs = [x for x in Frames_batch['Box'] if x != []]
+    Image_names = [x for x in Frames_batch['Key_features'] if x != []]
+    batchsize = len(Frames)#Frames_batch['batchsize']
+    
+    for i in Frames:
+        if (len(i) <= 1):
+            batchsize -=1
     Frame_Flags = Frames_batch['Flags']
     Out_Mask = [[] for i in range(batchsize)]
-    
     size = Frames[0][0].size()[2::] ####
-    print("\n had to change here in ipython, Frames shape now:",np.shape(Frames))
+#     print("\n had to change here in ipython, Frames shape now:",np.shape(Frames))
     
     torch.cuda.empty_cache()
     # msk_p = Key_mask
@@ -202,7 +222,22 @@ def process_SVOS_batch(Frames_batch, model, threshold=0.5, single_object=False, 
     Crop_size = [[] for i in range(batchsize)]
     BBox = [0 for i in range(batchsize)]
     Flags = [True for i in range(batchsize)]
+
     for idx in range(max(Frames_batch['Sizes'])):
+        if (len(Frames) <1):
+            print("Frames size is :", len(Frames))
+#         for batch, frame in enumerate(zip([i[min(idx, len(i)-1)] for i in Frames])):
+#             continue
+#         for batch, key in enumerate(zip([i[min(idx, len(i)-1)] for i in Key_features])):
+#             continue
+#         for batch, key_mask in enumerate(zip([i[min(idx, len(i)-1)] for i in Key_masks])):
+#             continue
+#         for batch, box in enumerate(zip([i[min(idx, len(i)-1)] for i in Boxs])):
+#             continue
+#         for batch, flag in enumerate(zip([i[min(idx, len(i)-1)] for i in Frame_Flags])):
+#             continue
+#         for batch, init_mask in enumerate(zip([i[min(idx, len(i)-1)] for i in Init_masks])):
+#             continue
         for batch, (frame, key, key_mask, box, flag, init_mask) in enumerate(zip([i[min(idx, len(i)-1)] for i in Frames], [i[min(idx, len(i)-1)] for i in Key_features], [i[min(idx, len(i)-1)] for i in Key_masks], [i[min(idx, len(i)-1)] for i in Boxs], [i[min(idx, len(i)-1)] for i in Frame_Flags], [i[min(idx, len(i)-1)] for i in Init_masks])):
             if flag == False:
                 Flags[batch] = 0
@@ -222,13 +257,13 @@ def process_SVOS_batch(Frames_batch, model, threshold=0.5, single_object=False, 
                             out0 = out0.ge(1.6).half() + 1
                         else:
                             out0 = out0.ge(1.6).float() + 1
-                    Out_Mask[batch].append(out0.data.cpu().numpy())
+                    Out_Mask[batch].append(out0.data.cpu().numpy()) # Store the first frame output mask which is already known
             # crop current frame
             frame = bbox_crop(frame[0], BBox[batch]).unsqueeze(0)     ######## was changed here in ipython
             # print(Crop_size)
             # print(batch)
             Crop_size[batch] = frame.size()
-            frame = F.upsample(frame, size, mode='bilinear')
+            frame = F.interpolate(frame, size, mode='bilinear',align_corners=True)
             Img[batch] = frame
 
         index_select = torch.nonzero(torch.tensor(Flags).cuda()).view(-1)
@@ -241,7 +276,8 @@ def process_SVOS_batch(Frames_batch, model, threshold=0.5, single_object=False, 
                 Flags[i] = tmp
                 tmp +=1
         inputs = [torch.cat(Img)[index_select], torch.cat(KFea)[index_select], torch.cat(KMsk)[index_select], torch.cat(PMsk)[index_select]]
-        outputs, _ = model(*inputs)
+        
+        outputs, _ = model(*inputs,disc_scale=disc_scale)
         Msk2 = [[] for i in range(batchsize)]
         Output = [None if Flags[ids] == -1 else outputs[0][Flags[ids]] for ids in range(batchsize)]
         for batch, (out, crop_size) in enumerate(zip(Output, Crop_size)):
@@ -271,10 +307,10 @@ def process_SVOS_batch(Frames_batch, model, threshold=0.5, single_object=False, 
                 msk = Msk2[batch][0] + 1
             Out_Mask[batch].append(msk[0, 0].data.cpu().numpy())
             BBox[batch] = msk2bbox(msk[0].ge(1.6))
-            PMsk[batch] = F.upsample(Variable(bbox_crop(msk[0], BBox[batch]).unsqueeze(0), volatile=True).cuda(), size)
+            PMsk[batch] = F.interpolate(bbox_crop(msk[0], BBox[batch]).unsqueeze(0).cuda(), size)
     return Out_Mask
 
-def fitpredict17(data_set, model, add_name='', threads=1, batchSize=1, save_root ='./test/'):
+def fitpredict17(data_set, model, add_name='', threads=1, batchSize=1, save_root ='./test/', disc_scale=0):
     if data_set.Datasets_params[0]['mode'] in ['16val', '16all']:
         threshold = 0.5
         single_object = True
@@ -291,7 +327,7 @@ def fitpredict17(data_set, model, add_name='', threads=1, batchSize=1, save_root
     model.eval()
     if not (os.path.exists(save_root)):
         os.mkdir(save_root)
-    test_SVOS_Video_batch(data_loader, model, save_root, threshold, single_object)
+    test_SVOS_Video_batch(data_loader, model, save_root, threshold, single_object, disc_scale=disc_scale)
     return
 
 
